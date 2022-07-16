@@ -30,7 +30,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e867eeb4de0ab9c53582fc77a0afc1ca88784ac85b7b6e77a468c44c6e3145b"
 dependencies = [
  "bare-metal",
- "riscv",
+ "riscv 0.8.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "vcell",
 ]
 
@@ -40,7 +40,7 @@ version = "0.1.0"
 dependencies = [
  "d1-pac",
  "panic-halt",
- "riscv",
+ "riscv 0.8.0 (git+https://github.com/rust-embedded/riscv)",
  "riscv-rt",
 ]
 
@@ -140,13 +140,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "riscv"
+version = "0.8.0"
+source = "git+https://github.com/rust-embedded/riscv#d50928b696583979ea1be58c459786a2b64c6340"
+dependencies = [
+ "bare-metal",
+ "bit_field",
+ "embedded-hal",
+]
+
+[[package]]
 name = "riscv-rt"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "527ddfacbbfeed89256163c2655b0392c4aa76dd95c0189dc05044bf2c47c3f8"
 dependencies = [
  "r0",
- "riscv",
+ "riscv 0.8.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "riscv-rt-macros",
  "riscv-target",
 ]
