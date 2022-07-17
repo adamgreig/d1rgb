@@ -3,10 +3,41 @@
 
 use panic_halt as _;
 
-fn print(uart: &d1_pac::UART0, message: &[u8]) {
-    for byte in message.iter() {
-        uart.thr().write(|w| unsafe { w.thr().bits(*byte) });
-        while uart.usr.read().tfnf().bit_is_clear() {}
+mod de;
+
+// Not sure if alignment is required or not, but force the issue.
+#[repr(C, align(256))]
+struct FrameBuffer([u8; 3*480*272]);
+static mut FB: FrameBuffer = FrameBuffer(*include_bytes!("ferris.data"));
+
+struct Uart(d1_pac::UART0);
+static mut PRINTER: Option<Uart> = None;
+impl core::fmt::Write for Uart {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for byte in s.as_bytes() {
+            self.0.thr().write(|w| unsafe { w.thr().bits(*byte) });
+            while self.0.usr.read().tfnf().bit_is_clear() {}
+        }
+        Ok(())
+    }
+}
+pub fn _print(args: core::fmt::Arguments) {
+    use core::fmt::Write;
+    unsafe {
+        PRINTER.as_mut().unwrap().write_fmt(args).ok();
+    }
+}
+#[macro_export]
+macro_rules! print {
+    ($($arg:tt)*) => {
+        $crate::_print(core::format_args!($($arg)*));
+    }
+}
+#[macro_export]
+macro_rules! println {
+    ($($arg:tt)*) => {
+        $crate::_print(core::format_args!($($arg)*));
+        $crate::print!("\r\n");
     }
 }
 
@@ -18,11 +49,14 @@ fn main() -> ! {
     let ccu = &p.CCU;
     ccu.uart_bgr.write(|w| w.uart0_gating().pass().uart0_rst().deassert());
 
-    // Enable PLL_VIDEO0. Fin=24M N=15 M=2 Fout(4X)=180M Fout(1X)=45M
+    // Enable PLL_VIDEO0. Fin=24M N=27 M=2 Fout(4X)=324M
+    // Aiming to exceed the 297MHz requirement for DE while being
+    // a multiply of 9MHz to generate 9M pixel clock.
+    // Though maybe DE needs to be exactly 297, or less than 297...
     ccu.pll_video0_ctrl.write(|w| unsafe {
         w.pll_output_div2().clear_bit()
          .pll_input_div2().set_bit()
-         .pll_n().bits(15 - 1)
+         .pll_n().bits(27 - 1)
          .pll_output_gate().clear_bit()
          .lock_enable().clear_bit()
          .pll_ldo_en().set_bit()
@@ -33,17 +67,19 @@ fn main() -> ! {
     unsafe { riscv::asm::delay(20_000) };
     ccu.pll_video0_ctrl.modify(|_, w| w.pll_output_gate().set_bit());
 
-    // Set TCON_LCD to PLL_VIDEO0(1X) and enable.
+    // Set TCON_LCD to PLL_VIDEO0(4X) and enable.
     ccu.tconlcd_clk.write(|w| unsafe {
         w.clk_gating().on()
-         .clk_src_sel().pll_video0_1x()
+         .clk_src_sel().pll_video0_4x()
          .factor_n().n1()
          .factor_m().bits(0)
     });
-    ccu.tconlcd_bgr.write(|w|
-        w.rst().deassert()
-         .gating().pass()
-    );
+    ccu.tconlcd_bgr.write(|w| w.rst().deassert().gating().pass());
+
+    // Enable Display Engine clock with VIDEO0(4X)=324MHz and bring out of reset.
+    // FACTOR_M=0 for M=1 for DE_CLK=CLK_SRC/1.
+    ccu.de_clk.write(|w| w.clk_gating().on().clk_src_sel().pll_video0_4x());
+    ccu.de_bgr.write(|w| w.rst().deassert().gating().pass());
 
     // Set PC1 LED to output.
     let gpio = &p.GPIO;
@@ -83,7 +119,7 @@ fn main() -> ! {
 
     // Configure UART0 for 115200 8n1.
     // By default APB1 is 24MHz, use divisor 13 for 115200.
-    let uart0 = &p.UART0;
+    let uart0 = p.UART0;
     uart0.mcr.write(|w| unsafe { w.bits(0) });
     uart0.fcr().write(|w| w.fifoe().set_bit());
     uart0.halt.write(|w| w.halt_tx().enabled());
@@ -92,20 +128,26 @@ fn main() -> ! {
     uart0.dlh().write(|w| unsafe { w.dlh().bits(0) });
     uart0.lcr.write(|w| w.dlab().rx_buffer().dls().eight());
     uart0.halt.write(|w| w.halt_tx().disabled());
-    print(uart0, b"Configuring system...\r\n");
+    unsafe { PRINTER = Some(Uart(uart0)) };
 
     // Turn on LCD backlight (PWM can come later).
     gpio.pd_dat.write(|w| unsafe { w.bits(1<<22) });
 
-    // Configure TCON_LCD in RGB666 mode for our 480x272 LCD.
+    // Configure TCON for RGB operation:
     let lcd0 = &p.TCON_LCD0;
+    // TCON_EN / LCD_EN
+    lcd0.lcd_gctl_reg.write(|w| unsafe { w.bits(1 << 31) });
+    // Configure TCON_LCD in RGB666 mode for our 480x272 LCD.
     lcd0.lcd_ctl_reg.write(|w| unsafe { w.bits(
         // LCD_CTL_REG.LCD_EN=0 to disable
-        (0 << 25)
+        (0 << 31)
         // LCD_CTL_REG.LCD_IF=0 for HV(Sync+DE)
         | (0 << 24)
-        // LCD_CTL_REG.LCD_SRC_SEL=001 for Color Check
-        | (0b001 << 0)
+        // Delay is VT-VD=292-272=20 (ie BP+FP?) (max 30)
+        | (20 << 4)
+        // LCD_CTL_REG.LCD_SRC_SEL=000 for Display Engine source.
+        // Try 0b001 for color check or 0b111 for grid check.
+        | (0b000 << 0)
     )});
     lcd0.lcd_hv_if_reg.write(|w| unsafe { w.bits(
         // LCD_HV_IF_REG.HV_MODE=0 for 24bit/cycle parallel mode.
@@ -114,8 +156,10 @@ fn main() -> ! {
     lcd0.lcd_dclk_reg.write(|w| unsafe { w.bits(
         // LCD_DCLK_REG.LCD_DCLK_EN=0001 for dclk_en=1, others=0
         (0b0001 << 28)
-        // LCD_DCLK_REG.LCD_DCLK_DIV=5 for /5 to obtain 9MHz DCLK from 45MHz.
-        | (5 << 0)
+        // Linux just sets bit 31, i.e. 0b1000, which is "reserved" in D1 docs.
+        //(1 << 31)
+        // LCD_DCLK_REG.LCD_DCLK_DIV=36 for /36 to obtain 9MHz DCLK from 324MHz.
+        | (36 << 0)
     )});
     lcd0.lcd_basic0_reg.write(|w| unsafe { w.bits(
         // LCD_BASIC0_REG.WIDTH_X=479 for 480px wide panel
@@ -147,8 +191,14 @@ fn main() -> ! {
     )});
     // LCD_EN
     lcd0.lcd_ctl_reg.modify(|r, w| unsafe { w.bits(r.bits() | (1 << 31)) });
-    // LCD_EN
-    lcd0.lcd_gctl_reg.write(|w| unsafe { w.bits(1 << 31) });
+
+    // Initialise display engine
+    unsafe {
+        println!("Framebuffer addr is {:08X}", FB.0.as_ptr() as u32);
+        println!("First bytes are: {:02X} {:02X} {:02X}",
+                 FB.0[0], FB.0[1], FB.0[2]);
+    }
+    unsafe { de::init(&FB.0) };
 
     // Blink LED
     loop { unsafe {
@@ -156,6 +206,5 @@ fn main() -> ! {
         riscv::asm::delay(100_000_000);
         gpio.pc_dat.write(|w| w.bits(0));
         riscv::asm::delay(100_000_000);
-        print(&uart0, b"Hello!\r\n");
     }}
 }
