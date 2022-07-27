@@ -49,6 +49,10 @@ fn main() -> ! {
     let ccu = &p.CCU;
     ccu.uart_bgr.write(|w| w.uart0_gating().pass().uart0_rst().deassert());
 
+    // Enable LEDC clock.
+    ccu.ledc_clk.write(|w| w.clk_gating().on().clk_src_sel().hosc());
+    ccu.ledc_bgr.write(|w| w.gating().pass().rst().deassert());
+
     // Enable PLL_VIDEO0. Fin=24M N=27 M=2 Fout(4X)=324M
     // Aiming to exceed the 297MHz requirement for DE while being
     // a multiply of 9MHz to generate 9M pixel clock.
@@ -81,9 +85,9 @@ fn main() -> ! {
     ccu.de_clk.write(|w| w.clk_gating().on().clk_src_sel().pll_video0_4x());
     ccu.de_bgr.write(|w| w.rst().deassert().gating().pass());
 
-    // Set PC1 LED to output.
+    // Set PC0 to LEDC_DO, PC1 LED to output.
     let gpio = &p.GPIO;
-    gpio.pc_cfg0.write(|w| w.pc1_select().output());
+    gpio.pc_cfg0.write(|w| w.pc0_select().ledc_do().pc1_select().output());
 
     // Set PB8 and PB9 to function 6, UART0, internal pullup.
     gpio.pb_cfg1.write(|w| w.pb8_select().uart0_tx().pb9_select().uart0_rx());
@@ -200,11 +204,52 @@ fn main() -> ! {
     }
     unsafe { de::init(&FB.0) };
 
+    // Configure LEDC
+    let ledc = &p.LEDC;
+    ledc.led_t01_timing_ctrl.write(|w| unsafe {
+        w.t1h_time().bits(0x14)
+         .t1l_time().bits(0x06)
+         .t0h_time().bits(0x07)
+         .t0l_time().bits(0x13)
+    });
+    ledc.ledc_data_finish_cnt.write(|w| unsafe {
+        w.led_wait_data_time().bits(0x1D4C)
+    });
+    ledc.led_reset_timing_ctrl.write(|w| unsafe {
+        w.tr_time().bits(0x1D4C)
+         .led_num().bits(0)
+    });
+    ledc.ledc_wait_time0_ctrl.write(|w| unsafe {
+        w.wait_tim0_en().set_bit()
+         .total_wait_time0().bits(0xFF)
+    });
+    ledc.ledc_dma_ctrl.write(|w| w.ledc_dma_en().clear_bit());
+    ledc.ledc_int_ctrl.write(|w| w.global_int_en().clear_bit());
+    ledc.ledc_ctrl.write(|w| unsafe {
+        w.total_data_length().bits(1)
+         .led_rgb_mode().grb()
+         .led_msb_top().msb()
+         .led_msb_g().msb()
+         .led_msb_r().msb()
+         .led_msb_b().msb()
+    });
+    set_led(ledc, 0x0000_00FF);
+
     // Blink LED
     loop { unsafe {
         gpio.pc_dat.write(|w| w.bits(2));
+        set_led(ledc, 0x0000FFFF);
         riscv::asm::delay(100_000_000);
+
         gpio.pc_dat.write(|w| w.bits(0));
+        set_led(ledc, 0x00FF00FF);
         riscv::asm::delay(100_000_000);
     }}
+}
+
+fn set_led(ledc: &d1_pac::LEDC, rgb: u32) {
+    ledc.ledc_ctrl.modify(|_, w| w.ledc_soft_reset().set_bit());
+    ledc.ledc_data.write(|w| unsafe { w.bits(rgb) });
+    ledc.ledc_ctrl.modify(|_, w| w.ledc_en().enable().reset_led_en().set_bit());
+    while ledc.ledc_ctrl.read().reset_led_en().bit_is_set() {}
 }
